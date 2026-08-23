@@ -880,6 +880,35 @@ def assert_http_error(
     return payload
 
 
+def assert_omni_text_responses_identical(responses: Any, context: str = "") -> None:
+    """Assert that every response in the sequence produced byte-identical text.
+
+    Special assert for cache-path parity tests: the same prompt served through
+    different cache states (cold encode vs encoder-cache hit) must yield the
+    same text under greedy decoding, since both paths consume the identical
+    cached embedding tensor.
+
+    Args:
+        responses: Sequence of OmniResponse objects (>= 2).
+
+    Raises:
+        AssertionError: When any response failed or texts differ.
+    """
+    assert len(responses) >= 2, "Need at least two responses to compare"
+    texts = []
+    for i, response in enumerate(responses):
+        assert response.success, f"Request {i} failed{': ' + context if context else ''}."
+        assert response.text_content is not None, f"Request {i} produced no text output."
+        texts.append(response.text_content)
+    baseline = texts[0]
+    for i, text in enumerate(texts[1:], start=1):
+        assert text == baseline, (
+            f"Text output diverged between request 0 and request {i}"
+            f"{' (' + context + ')' if context else ''}:\n"
+            f"  request 0: {baseline!r}\n  request {i}: {text!r}"
+        )
+
+
 __all__ = [
     "assert_audio_diffusion_response",
     "assert_audio_speech_response",
@@ -889,6 +918,7 @@ __all__ = [
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",
+    "assert_omni_text_responses_identical",
     "assert_video_diffusion_response",
     "assert_video_valid",
     "assert_audio_valid",

@@ -162,3 +162,22 @@ Because we have multimodal data in a scheduled span that isn't fully precomputed
 When we pass our multimodal tensors to the language model component in the same stage, we'll then expect the same outputs, because the prefix caching behaviors in vLLM-Omni / vLLM match, so the LLM will use vLLM's KV cache manager's prefix caching to correctly handle the attention information for `Block 1` while calculating the outputs for `Block 2`, giving us the correct results for processing `Block 2` with the context of `Block 1`.
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
+
+### Caveat: `mm_processor_cache_gb: 0` silently disables encoder-output reuse
+
+The encoder cache described above is keyed by a **content hash** of each multimodal item (`mm_hash`), and it has no dedicated on/off switch — it is expected to work whenever the same image/audio/video reappears across requests.
+
+However, upstream vLLM skips computing content hashes entirely when **both** of the following hold (`vllm/renderers/base.py`, `_process_mm_uuids`):
+
+- `mm_processor_cache_gb: 0` (the multimodal processor cache is explicitly disabled), **and**
+- `enable_prefix_caching: false` on the stage.
+
+In that configuration, multimodal identifiers degrade to per-request counter IDs (`renderer0-mm-<N>-<modality>-<i>`), overriding even user-provided UUIDs. Since no two requests ever share an identifier, the encoder cache can never match across requests: **every** occurrence of the same image or audio is re-encoded, including byte-identical repeats — with no warning logged.
+
+This matters for omni pipelines because many deploy configs (for example every MiniCPM-o 4.5 layout) ship with `enable_prefix_caching: false`, so one half of the condition is already true by default. Setting `mm_processor_cache_gb: 0` on such a stage to save host memory therefore silently forfeits **all** cross-request encoder reuse for every modality. If you need the processor cache off but still want encoder-output reuse, keep prefix caching enabled on that stage, or accept the re-encoding cost knowingly.
+
+Upstream treats this as intended semantics ("both caches off means no reuse is wanted"); it is documented here because the coupling between a host-memory knob and GPU-side encoder reuse is easy to miss. See [vllm-project/vllm-omni#5069](https://github.com/vllm-project/vllm-omni/issues/5069) for the evaluation that surfaced it.
+
+### Caveat: cached encoder outputs are batch-composition dependent
+
+A separate property, also surfaced in [#5069](https://github.com/vllm-project/vllm-omni/issues/5069): encoders that pad a batch of multimodal items to the batch maximum (as the MiniCPM-o SigLIP and Whisper paths do) produce slightly different outputs for the *same* item depending on which other items shared its encoder batch — a bf16 accumulation-order effect, not a masking bug. Because the encoder cache is keyed by content hash alone, it permanently serves whichever batch-composition variant was computed first; a cache hit is therefore not bit-identical to a fresh encode under a different composition, and under greedy decoding this can occasionally change generated text. This is an accuracy/determinism consideration to weigh when reasoning about repeated-multimodal workloads, and it exists with prefix caching disabled as well.

@@ -255,6 +255,21 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 
 ## Notes (applies to all layouts)
 
+- **Multimodal caching**: repeated identical images/audios are served from
+  vLLM's content-addressed encoder cache (always on, keyed by `mm_hash`) —
+  the vision/audio encoder is skipped on a hit and only missing items in a
+  mixed request are encoded. Two caveats:
+  - Do **not** set `mm_processor_cache_gb: 0` on stage 0. All MiniCPM-o
+    layouts ship `enable_prefix_caching: false`, and with both settings off
+    upstream vLLM replaces content hashes with per-request counter IDs, which
+    silently disables **all** cross-request encoder reuse (every repeat is
+    re-encoded, no warning is logged). Details:
+    [`docs/design/feature/prefix_caching.md`](../../docs/design/feature/prefix_caching.md).
+  - Keep `enable_prefix_caching: false` (the shipped default): output parity
+    with the prefix-cache path has not been established for this model —
+    tracked in
+    [vllm-project/vllm-omni#5069](https://github.com/vllm-project/vllm-omni/issues/5069).
+
 - **Code2Wav dependency**: Stage 2 loads `Token2wav` from the
   MiniCPM-o-flavored
   vocoder (PyPI package `stepaudio2-minicpmo` — NOT the upstream

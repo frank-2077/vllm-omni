@@ -116,3 +116,76 @@ def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     video = generate_synthetic_video(24, 24, 20)["np_array"]
     request_config = {"prompts": get_question("video"), "videos": video, "modalities": ["audio"]}
     omni_runner_handler.send_omni_request(request_config)
+
+
+def _cache_probe_audio(phrase: str):
+    """Synthetic audio with a phrase-unique mm_hash.
+
+    Each distinct phrase yields distinct waveform bytes, so the encoder-cache
+    tests below control exactly which items are warm: they never collide with
+    the default-phrase audio used by the other tests in this module.
+    """
+    audio = generate_synthetic_audio(1, 1, 16000, phrase_text=phrase)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
+    return (audio, 16000)
+
+
+@pytest.mark.full_model
+@pytest.mark.omni
+@pytest.mark.cache
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_audio_encoder_cache_warm_repeat_parity(omni_runner, omni_runner_handler) -> None:
+    """Repeating an identical audio request must reproduce the same text.
+
+    Regression for the audio half of the #5069 encoder-cache evaluation: the
+    first request encodes the audio cold; the byte-identical second request is
+    served from vLLM's content-addressed encoder cache (mm_hash) without
+    re-entering the Whisper encoder. Both paths consume the same cached
+    embedding tensor, so greedy text must match exactly. A divergence here
+    means cached encoder outputs are corrupted or misapplied on the hit path.
+    """
+    from tests.helpers.assertions import assert_omni_text_responses_identical
+
+    audio = _cache_probe_audio("encoder cache warm repeat probe")
+    request_config = {"prompts": get_question("audio"), "audios": audio, "modalities": ["text"]}
+    responses = [omni_runner_handler.send_omni_request(request_config) for _ in range(2)]
+    assert_omni_text_responses_identical(responses, context="audio warm repeat")
+
+
+@pytest.mark.full_model
+@pytest.mark.omni
+@pytest.mark.cache
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_audio_encoder_cache_mixed_hit_partition_parity(omni_runner, omni_runner_handler) -> None:
+    """Mixed hit/miss and fully-cached paths must agree, item order preserved.
+
+    Regression for the #5069 audio attribution probe. Sequence:
+      1. warm item A alone (fills its encoder-cache entry);
+      2. request [A, C]: A is a cache hit, C is encoded live — the encoder
+         receives only the missing item;
+      3. repeat [A, C] byte-identically: both items are now cache hits and the
+         encoder is not entered at all.
+    Requests 2 and 3 consume identical embedding tensors, so their greedy text
+    must match exactly. A divergence means cached embeddings were placed into
+    the wrong placeholder positions (ordering) or partial-hit partitioning
+    corrupted the batch.
+    """
+    from tests.helpers.assertions import assert_omni_text_responses_identical
+
+    audio_a = _cache_probe_audio("encoder cache mixed probe alpha")
+    audio_c = _cache_probe_audio("encoder cache mixed probe charlie")
+
+    # Step 1: make A warm so step 2 exercises the partial-hit partition.
+    omni_runner_handler.send_omni_request({"prompts": get_question("audio"), "audios": audio_a, "modalities": ["text"]})
+
+    mixed_config = {
+        "prompts": "Are these two audio clips the same?",
+        # Nested list: one prompt carrying two audio items (two placeholders).
+        "audios": [[audio_a, audio_c]],
+        "modalities": ["text"],
+    }
+    responses = [omni_runner_handler.send_omni_request(mixed_config) for _ in range(2)]
+    assert_omni_text_responses_identical(responses, context="audio mixed hit/miss vs fully cached")
