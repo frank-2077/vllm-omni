@@ -898,7 +898,7 @@ def assert_omni_text_responses_identical(responses: Any, context: str = "") -> N
     texts = []
     for i, response in enumerate(responses):
         assert response.success, f"Request {i} failed{': ' + context if context else ''}."
-        assert response.text_content is not None, f"Request {i} produced no text output."
+        assert response.text_content, f"Request {i} produced no text output."
         texts.append(response.text_content)
     baseline = texts[0]
     for i, text in enumerate(texts[1:], start=1):

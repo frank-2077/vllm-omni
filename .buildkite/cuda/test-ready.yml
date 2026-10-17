@@ -165,6 +165,7 @@ steps:
         source_file_dependencies:
           - tests/e2e/offline_inference/test_minicpmo_4_5.py
           - tests/helpers/assertions.py
+          - tests/helpers/minicpmo_encoder_cache.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
         commands:
           - |

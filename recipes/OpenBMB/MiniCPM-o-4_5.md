@@ -256,7 +256,7 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 ## Notes (applies to all layouts)
 
 - **Multimodal caching**: repeated identical images/audios are served from
-  vLLM's content-addressed encoder cache (always on, keyed by `mm_hash`) —
+  vLLM's content-addressed encoder cache (keyed by `mm_hash`, while the entry remains resident) —
   the vision/audio encoder is skipped on a hit and only missing items in a
   mixed request are encoded. Two caveats:
   - Do **not** set `mm_processor_cache_gb: 0` on stage 0. All MiniCPM-o
@@ -315,3 +315,33 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 - **Response choices**: text and audio are separate choices. SDK clients
   should select the choice whose `message.audio.data` is populated rather
   than assuming `choices[0]` contains audio.
+
+## Audio encoder cache regression tests
+
+Run the CPU hashing and prefix tensor-cache checks first:
+
+```bash
+pytest tests/core/test_mm_block_hash_minicpmo.py -q
+pytest tests/helpers/tests/test_minicpmo_encoder_cache.py -q
+```
+
+The full-model tests default to the single large-memory GPU deployment.
+For multiple RTX 4090s, copy `vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`
+and choose available devices in that local copy. Its default layout uses four
+GPUs for Stage 0 and one each for Stages 1 and 2. Ensure Stage 0 accepts at least
+two audio items (`limit_mm_per_prompt.audio: 2`), keeps a nonzero
+`mm_processor_cache_gb`, and has enough encoder cache capacity for both clips.
+Keep `enable_prefix_caching: false` at the deployment's top level.
+
+```bash
+MINICPMO_CACHE_TEST_MODEL=/path/to/MiniCPM-o-4_5 \
+MINICPMO_CACHE_TEST_DEPLOY=/path/to/local-4090.yaml \
+pytest tests/e2e/offline_inference/test_minicpmo_4_5.py \
+  -m cache --run-level full_model -v
+```
+
+The tests require real weights. They assert Whisper call sequences `[1, 0]`
+and `[1, 1, 0]` on **each** Stage 0 TP rank, plus encoded item counts, cached
+embedding placement, reversed audio ordering, and text parity. Startup
+profiling is excluded from the counters. A single 24 GB GPU is insufficient
+for the default full pipeline; CPU checks can run independently.

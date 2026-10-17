@@ -165,7 +165,7 @@ Finally, we look up the output hidden states/multimodal tensors corresponding to
 
 ### Caveat: `mm_processor_cache_gb: 0` silently disables encoder-output reuse
 
-The encoder cache described above is keyed by a **content hash** of each multimodal item (`mm_hash`), and it has no dedicated on/off switch — it is expected to work whenever the same image/audio/video reappears across requests.
+The encoder cache described above is keyed by a **content hash** of each multimodal item (`mm_hash`), and can reuse an entry across requests while that entry remains resident. Reuse also requires stable multimodal identifiers.
 
 However, upstream vLLM skips computing content hashes entirely when **both** of the following hold (`vllm/renderers/base.py`, `_process_mm_uuids`):
 
@@ -180,4 +180,24 @@ Upstream treats this as intended semantics ("both caches off means no reuse is w
 
 ### Caveat: cached encoder outputs are batch-composition dependent
 
-A separate property, also surfaced in [#5069](https://github.com/vllm-project/vllm-omni/issues/5069): encoders that pad a batch of multimodal items to the batch maximum (as the MiniCPM-o SigLIP and Whisper paths do) produce slightly different outputs for the *same* item depending on which other items shared its encoder batch — a bf16 accumulation-order effect, not a masking bug. Because the encoder cache is keyed by content hash alone, it permanently serves whichever batch-composition variant was computed first; a cache hit is therefore not bit-identical to a fresh encode under a different composition, and under greedy decoding this can occasionally change generated text. This is an accuracy/determinism consideration to weigh when reasoning about repeated-multimodal workloads, and it exists with prefix caching disabled as well.
+A separate property, also surfaced in [#5069](https://github.com/vllm-project/vllm-omni/issues/5069): encoders that pad a batch of multimodal items to the batch maximum (as the MiniCPM-o SigLIP and Whisper paths do) can produce slightly different outputs for the *same* item depending on which other items shared its encoder batch. Padding shapes and reduced-precision arithmetic can contribute to these differences; their cause must be checked for the specific encoder and backend. Because the encoder cache is keyed by content hash alone, it serves the stored variant until that entry is evicted; a cache hit is therefore not guaranteed to be bit-identical to a fresh encode under a different composition, and under greedy decoding this can occasionally change generated text. This is an accuracy/determinism consideration to weigh when reasoning about repeated-multimodal workloads, and it exists with prefix caching disabled as well.
+
+### Verifying MiniCPM-o audio encoder reuse
+
+The cache tests in `tests/e2e/offline_inference/test_minicpmo_4_5.py` use a
+test-only worker extension on Stage 0. After model initialization, the probe
+counts actual Whisper forward calls on each TP rank and records the hashes
+scheduled for encoding. It also checks the gathered embeddings and their mask
+against the cached tensors at the request's placeholder positions.
+
+The required per-request call sequences are `[1, 0]` for a cold/warm repeat
+and `[1, 1, 0]` for warming A, requesting `[A, C]`, and repeating `[A, C]`.
+The mixed request must encode exactly one item with a hash different from A.
+Both fully cached orders, `[A, C]` and `[C, A]`, must retain their respective
+placeholder order without running Whisper. Every request, including warmup,
+must succeed and produce nonempty text. Greedy text is compared within each
+identical-prompt pair; text equality alone does not demonstrate a cache hit.
+
+Keep KV prefix caching disabled during this test so it cannot hide an encoder
+cache miss. The probe is removed after each test and does not change model
+outputs or cache contents.

@@ -8,8 +8,10 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
 
+from tests.helpers.assertions import assert_omni_text_responses_identical
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.minicpmo_encoder_cache import assert_audio_cache_trace, audio_cache_rpc
 from tests.helpers.stage_config import get_deploy_config_path
 
 models = ["openbmb/MiniCPM-o-4_5"]
@@ -17,7 +19,27 @@ models = ["openbmb/MiniCPM-o-4_5"]
 _CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 
-test_params = [(model, None, {"deploy_config": _CI_DEPLOY, "trust_remote_code": True}) for model in models]
+test_params = [(model, _CI_DEPLOY, {"trust_remote_code": True}) for model in models]
+cache_test_params = [
+    (
+        os.environ.get("MINICPMO_CACHE_TEST_MODEL", model),
+        os.environ.get("MINICPMO_CACHE_TEST_DEPLOY", _CI_DEPLOY),
+        {
+            "trust_remote_code": True,
+            "worker_extension_cls": "tests.helpers.minicpmo_encoder_cache.MiniCPMOEncoderCacheProbe",
+        },
+    )
+    for model in models
+]
+
+
+@pytest.fixture
+def audio_cache_probe(omni_runner):
+    try:
+        assert all(result is True for result in audio_cache_rpc(omni_runner, "start_audio_cache_probe"))
+        yield lambda: audio_cache_rpc(omni_runner, "read_audio_cache_probe")
+    finally:
+        assert all(result is True for result in audio_cache_rpc(omni_runner, "stop_audio_cache_probe"))
 
 
 def get_question(prompt_type: str = "text") -> str:
@@ -121,9 +143,8 @@ def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
 def _cache_probe_audio(phrase: str):
     """Synthetic audio with a phrase-unique mm_hash.
 
-    Each distinct phrase yields distinct waveform bytes, so the encoder-cache
-    tests below control exactly which items are warm: they never collide with
-    the default-phrase audio used by the other tests in this module.
+    Use distinct first words because the generator truncates speech to one
+    second. Tests also check that the resulting content hashes differ.
     """
     audio = generate_synthetic_audio(1, 1, 16000, phrase_text=phrase)["np_array"]
     if len(audio.shape) == 2:
@@ -134,58 +155,71 @@ def _cache_probe_audio(phrase: str):
 @pytest.mark.full_model
 @pytest.mark.omni
 @pytest.mark.cache
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_audio_encoder_cache_warm_repeat_parity(omni_runner, omni_runner_handler) -> None:
-    """Repeating an identical audio request must reproduce the same text.
-
-    Regression for the audio half of the #5069 encoder-cache evaluation: the
-    first request encodes the audio cold; the byte-identical second request is
-    served from vLLM's content-addressed encoder cache (mm_hash) without
-    re-entering the Whisper encoder. Both paths consume the same cached
-    embedding tensor, so greedy text must match exactly. A divergence here
-    means cached encoder outputs are corrupted or misapplied on the hit path.
-    """
-    from tests.helpers.assertions import assert_omni_text_responses_identical
-
-    audio = _cache_probe_audio("encoder cache warm repeat probe")
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", cache_test_params, indirect=True)
+def test_audio_encoder_cache_warm_repeat_parity(omni_runner, omni_runner_handler, audio_cache_probe) -> None:
+    """Cold/warm requests must call Whisper [1, 0] and return identical text."""
+    audio = _cache_probe_audio("Whisper warm repeat probe")
     request_config = {"prompts": get_question("audio"), "audios": audio, "modalities": ["text"]}
-    responses = [omni_runner_handler.send_omni_request(request_config) for _ in range(2)]
+    responses, trace = [], []
+    for _ in range(2):
+        response = omni_runner_handler.send_omni_request(request_config)
+        assert response.success and response.text_content, "Audio cache request failed or produced empty text"
+        responses.append(response)
+        trace.append(audio_cache_probe())
+    assert_audio_cache_trace(trace, expected_calls=[1, 0], expected_items=[1, 0])
+    for rank in range(len(trace[0])):
+        audio_hash = trace[0][rank]["encoded_hashes"][0]
+        assert all(step[rank]["gathered_hashes"] == [[audio_hash]] for step in trace)
     assert_omni_text_responses_identical(responses, context="audio warm repeat")
 
 
 @pytest.mark.full_model
 @pytest.mark.omni
 @pytest.mark.cache
-@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=1)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_audio_encoder_cache_mixed_hit_partition_parity(omni_runner, omni_runner_handler) -> None:
-    """Mixed hit/miss and fully-cached paths must agree, item order preserved.
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner", cache_test_params, indirect=True)
+def test_audio_encoder_cache_mixed_hit_partition_parity(omni_runner, omni_runner_handler, audio_cache_probe) -> None:
+    """Warm A, encode only C in [A, C], then reuse both; also check [C, A]."""
+    audio_a = _cache_probe_audio("Alpha mixed cache probe")
+    audio_c = _cache_probe_audio("Charlie mixed cache probe")
+    assert not (audio_a[0] == audio_c[0]).all(), "Mixed probe requires distinct waveform content"
 
-    Regression for the #5069 audio attribution probe. Sequence:
-      1. warm item A alone (fills its encoder-cache entry);
-      2. request [A, C]: A is a cache hit, C is encoded live — the encoder
-         receives only the missing item;
-      3. repeat [A, C] byte-identically: both items are now cache hits and the
-         encoder is not entered at all.
-    Requests 2 and 3 consume identical embedding tensors, so their greedy text
-    must match exactly. A divergence means cached embeddings were placed into
-    the wrong placeholder positions (ordering) or partial-hit partitioning
-    corrupted the batch.
-    """
-    from tests.helpers.assertions import assert_omni_text_responses_identical
-
-    audio_a = _cache_probe_audio("encoder cache mixed probe alpha")
-    audio_c = _cache_probe_audio("encoder cache mixed probe charlie")
-
-    # Step 1: make A warm so step 2 exercises the partial-hit partition.
-    omni_runner_handler.send_omni_request({"prompts": get_question("audio"), "audios": audio_a, "modalities": ["text"]})
-
+    warmup = omni_runner_handler.send_omni_request(
+        {"prompts": get_question("audio"), "audios": audio_a, "modalities": ["text"]}
+    )
+    assert warmup.success and warmup.text_content, "Audio A warmup failed or produced empty text"
+    trace = [audio_cache_probe()]
     mixed_config = {
-        "prompts": "Are these two audio clips the same?",
-        # Nested list: one prompt carrying two audio items (two placeholders).
+        "prompts": "Describe the first audio clip, then describe the second audio clip.",
         "audios": [[audio_a, audio_c]],
         "modalities": ["text"],
     }
-    responses = [omni_runner_handler.send_omni_request(mixed_config) for _ in range(2)]
+    responses = []
+    for _ in range(2):
+        response = omni_runner_handler.send_omni_request(mixed_config)
+        assert response.success and response.text_content, "Mixed audio request failed or produced empty text"
+        responses.append(response)
+        trace.append(audio_cache_probe())
+    assert_audio_cache_trace(trace, expected_calls=[1, 1, 0], expected_items=[1, 1, 0])
+    for rank in range(len(trace[0])):
+        audio_hash_a = trace[0][rank]["encoded_hashes"][0]
+        audio_hash_c = trace[1][rank]["encoded_hashes"][0]
+        assert audio_hash_a != audio_hash_c, "Mixed probe must encode C, not warm A"
+        assert trace[0][rank]["gathered_hashes"] == [[audio_hash_a]]
+        assert trace[1][rank]["gathered_hashes"] == [[audio_hash_a, audio_hash_c]]
+        assert trace[2][rank]["gathered_hashes"] == [[audio_hash_a, audio_hash_c]]
     assert_omni_text_responses_identical(responses, context="audio mixed hit/miss vs fully cached")
+
+    reversed_config = {**mixed_config, "audios": [[audio_c, audio_a]]}
+    reversed_responses, reversed_trace = [], []
+    for _ in range(2):
+        response = omni_runner_handler.send_omni_request(reversed_config)
+        assert response.success and response.text_content, "Reversed audio request failed or produced empty text"
+        reversed_responses.append(response)
+        reversed_trace.append(audio_cache_probe())
+    assert_audio_cache_trace(reversed_trace, expected_calls=[0, 0], expected_items=[0, 0])
+    for rank in range(len(trace[0])):
+        expected = trace[1][rank]["gathered_hashes"][0][::-1]
+        assert all(step[rank]["gathered_hashes"] == [expected] for step in reversed_trace)
+    assert_omni_text_responses_identical(reversed_responses, context="reversed audio fully cached repeat")

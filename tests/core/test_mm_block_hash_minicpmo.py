@@ -10,13 +10,13 @@ Covers, for the MiniCPM-o 4.5 placeholder geometry (64 mm tokens per image via
              that keeps same-item-different-position blocks distinct
   L1.5       OmniTensorPrefixCache round-trip: the merged hidden states for a
              prefix-cache hit must equal the full-forward reference (the CPU
-             proxy for hypothesis H2 in probe_mm_cache/README.md)
+             proxy for prefix-cache merge correctness)
 
 Run:
     pytest tests/core/test_mm_block_hash_minicpmo.py -q
 """
 
-import hashlib
+import inspect
 
 import numpy as np
 import pytest
@@ -35,6 +35,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # misalign it.
 MM_LEN = 64
 BLOCK = 16
+
+
+def _mm_hash(**kwargs):
+    # vLLM 0.28 made the hash algorithm an explicit positional argument.
+    if "algorithm" in inspect.signature(MultiModalHasher.hash_kwargs).parameters:
+        return MultiModalHasher.hash_kwargs("sha256", **kwargs)
+    return MultiModalHasher.hash_kwargs(**kwargs)
 
 
 class _Req:
@@ -67,27 +74,27 @@ def _img(seed: int, w: int = 8, h: int = 8) -> np.ndarray:
 
 
 def test_mm_hash_deterministic_within_and_across_calls():
-    a1 = MultiModalHasher.hash_kwargs(image=_img(0))
-    a2 = MultiModalHasher.hash_kwargs(image=_img(0))
+    a1 = _mm_hash(image=_img(0))
+    a2 = _mm_hash(image=_img(0))
     assert a1 == a2
 
 
 def test_mm_hash_discriminates_content_and_kwarg_name():
-    base = MultiModalHasher.hash_kwargs(image=_img(0))
-    assert MultiModalHasher.hash_kwargs(image=_img(1)) != base
+    base = _mm_hash(image=_img(0))
+    assert _mm_hash(image=_img(1)) != base
     # Same bytes under a different modality kwarg must not collide.
-    assert MultiModalHasher.hash_kwargs(audio=_img(0)) != base
+    assert _mm_hash(audio=_img(0)) != base
 
 
 def test_mm_hash_discriminates_dtype_and_shape():
     img = _img(0)
-    base = MultiModalHasher.hash_kwargs(image=img)
-    assert MultiModalHasher.hash_kwargs(image=img.astype(np.int32)) != base
-    assert MultiModalHasher.hash_kwargs(image=img.reshape(8, 8 * 3)) != base
+    base = _mm_hash(image=img)
+    assert _mm_hash(image=img.astype(np.int32)) != base
+    assert _mm_hash(image=img.reshape(8, 8 * 3)) != base
     # Audio analogue: same samples at a different sample rate must differ once
     # the rate participates in the hashed kwargs.
     wav = np.zeros(1600, dtype=np.float32)
-    assert MultiModalHasher.hash_kwargs(audio=(wav, 16000)) != MultiModalHasher.hash_kwargs(audio=(wav, 24000))
+    assert _mm_hash(audio=(wav, 16000)) != _mm_hash(audio=(wav, 24000))
 
 
 # ---------------------------------------------------------------------------
@@ -283,10 +290,10 @@ def test_omni_prefix_cache_partial_block_tail_is_not_served_stale():
     assert torch.equal(cache.hidden_states_cache[0], second), "stale slot content survived an overwrite"
 
 
-def test_sha256_stability_reference():
-    """Guard against the hashing backend silently changing representation:
-    the digest of a fixed byte string must be stable across runs/processes."""
-    assert (
-        hashlib.sha256(b"minicpmo-4_5-mm-cache-probe").hexdigest()
-        == "57166a59ebec2ff45f3872c73ccb7e0370c2e9a1a76a2ff48d42d727372561c5"
-    )
+def test_audio_hashes_preserve_item_identity_when_reordered():
+    audio_a = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
+    audio_c = audio_a[::-1].copy()
+    hashes_ac = [_mm_hash(audio=(audio, 16000)) for audio in (audio_a, audio_c)]
+    hashes_ca = [_mm_hash(audio=(audio, 16000)) for audio in (audio_c, audio_a)]
+    assert hashes_ac[0] != hashes_ac[1]
+    assert hashes_ca == hashes_ac[::-1]
